@@ -109,6 +109,14 @@ class Session {
 	#emit_dispatch = false;
 	/** Monotonic identifier for per-region node scratch state. @type {number} */
 	#region_id = 0;
+	/** Registry keys claimed by async descriptors in this stream. @type {Set<string>} */
+	#keys = new Set();
+	/** Whether tail blocks must not depend on the head having been evaluated. @type {boolean} */
+	#detached;
+	/** Whether the head has been emitted and the graph reset for detached tail blocks. @type {boolean} */
+	#detached_tail = false;
+	/** Whether a detached tail block has already taken over the saved session. @type {boolean} */
+	#detached_started = false;
 
 	/**
 	 * Creates an isolated server-side stream session.
@@ -129,6 +137,7 @@ class Session {
 		this.#graph = create_graph(root, (value, node, graph) => this.#classify(value, node, graph));
 		this.#abort = () => void this.#cancel(signal?.reason);
 		signal?.addEventListener('abort', this.#abort, { once: true });
+		this.#detached = options.detached === true;
 	}
 
 	/** @param {unknown} value @returns {Promise<UnevalStreamResult>} */
@@ -178,11 +187,15 @@ class Session {
 			this.#start_unstarted();
 
 			if (this.#active === 0 && this.#batch.length === 0) {
-				return { head: this.#wrap_head(head_region, operations + this.#cleanup_source()), tail: empty_tail(), id: this.#id };
+				return { head: this.#wrap_head(head_region, operations + this.#cleanup_source(this.#id)), tail: empty_tail(), id: this.#id };
 			}
 
-			this.#emit_dispatch = true;
-			return { head: this.#wrap_head(head_region, operations), tail: this.#tail(), id: this.#id };
+			if (!this.#detached) this.#emit_dispatch = true;
+			const head = this.#wrap_head(head_region, operations);
+			// Detach only after the head is fully rendered, since rendering records which
+			// runtime helpers the head defined and detaching forgets them.
+			if (this.#detached) this.#detach();
+			return { head, tail: this.#tail(), id: this.#id };
 		} catch (error) {
 			await this.#cancel(error);
 			throw this.#failure ?? error;
@@ -249,6 +262,35 @@ class Session {
 		return { defs, source: resolved };
 	}
 
+	/**
+	 * Severs the tail from the head once the head has been emitted. Every source still
+	 * pending must be keyed, since detached blocks can only address the registry. Head
+	 * identities are forgotten so tail regions re-serialize shared values, except keyed
+	 * async values, which resolve to the registered client target. The first detached block
+	 * resets the saved session's positional state (see `#emit_batch`), so the positional
+	 * counters restart and runtime helpers are forgotten so blocks define what they use.
+	 */
+	#detach() {
+		for (const source of this.#sources) {
+			if (!source.terminal && source.node.data.key === undefined) {
+				throw this.#error('Cannot detach an unkeyed asynchronous value', source.node.value);
+			}
+		}
+		for (const node of this.#graph.nodes) {
+			if (!node) continue;
+			if (node.kind === 'Async' && node.data.key !== undefined && !node.data.state.terminal) {
+				node.reference = { root: `s.k[${stringify_string(node.data.key)}][0]`, segments: [] };
+			} else {
+				node.reference = undefined;
+			}
+		}
+		this.#runtimes_emitted = {};
+		this.#anchor = 1;
+		this.#slot = 0;
+		this.#collection = 0;
+		this.#detached_tail = true;
+	}
+
 	#begin_transaction() {
 		this.#transaction_depth++;
 		return { undo: this.#undo.length, graph: checkpoint(this.#graph) };
@@ -294,6 +336,7 @@ class Session {
 			case 'slot': previous = this.#slot; this.#slot = value; break;
 			case 'anchor': previous = this.#anchor; this.#anchor = value; break;
 			case 'active': previous = this.#active; this.#active = value; break;
+			case 'detached_started': previous = this.#detached_started; this.#detached_started = value; break;
 		}
 		if (transactional) this.#undo.push(() => {
 			const depth = this.#transaction_depth;
@@ -462,6 +505,13 @@ class Session {
 	 * @returns {{ state: Source, classification: Classification }}
 	 */
 	#add_source(node, descriptor, type) {
+		/** @type {string | undefined} */
+		const key = descriptor.id;
+		if (key !== undefined) {
+			if (this.#keys.has(key)) throw this.#error(`Duplicate asynchronous value id ${stringify_string(key)}`, node.value);
+			this.#keys.add(key);
+			if (this.#transaction_depth) this.#undo.push(() => this.#keys.delete(key));
+		}
 		let captured = false;
 		const control = () => {
 			if (captured) throw new TypeError('devalue: capture may only be called once');
@@ -476,7 +526,7 @@ class Session {
 		this.#set_private('pending', pending + 1);
 		/** @type {Source} */
 		const state = { node, descriptor, type, started: false, terminal: false, cleaned: false, active: true, flushed_pending: 0 };
-		const classification = { kind: 'Async', data: { source, pending, captured, state }, edges: [] };
+		const classification = { kind: 'Async', data: { source, pending, captured, state, key }, edges: [] };
 		this.#sources.add(state);
 		this.#unstarted.push(state);
 		if (this.#transaction_depth) this.#undo.push(() => {
@@ -548,6 +598,9 @@ class Session {
 	 * @param {any} descriptor
 	 */
 	#validate_value_descriptor(descriptor) {
+		if (descriptor.id !== undefined && typeof descriptor.id !== 'string') {
+			throw new TypeError('Invalid async-value id');
+		}
 		if ((typeof descriptor.source !== 'object' || descriptor.source === null) && typeof descriptor.source !== 'function') {
 			throw new TypeError('Invalid async-value source');
 		}
@@ -565,6 +618,9 @@ class Session {
 	 * @param {any} descriptor
 	 */
 	#validate_sequence_descriptor(descriptor) {
+		if (descriptor.id !== undefined && typeof descriptor.id !== 'string') {
+			throw new TypeError('Invalid async-sequence id');
+		}
 		if ((typeof descriptor.source !== 'object' || descriptor.source === null) && typeof descriptor.source !== 'function') {
 			throw new TypeError('Invalid async-sequence source');
 		}
@@ -792,6 +848,10 @@ class Session {
 		/** @param {GraphNode | undefined} node */
 		const visit = (node) => {
 			if (!node || node.reference || node.region_id === region_id) return;
+			if (this.#detached_tail && node.kind === 'Async' && node.data.state.terminal) {
+				// A head value that already settled has no registry entry left to address.
+				throw this.#error('Cannot reference a settled asynchronous value from a detached tail', node.value);
+			}
 			node.region_id = region_id;
 			node.uses = 0;
 			node.hoisted = false;
@@ -858,8 +918,10 @@ class Session {
 		/** @param {GraphNode} node */
 		const is_sparse = (node) => node.kind === 'Array' && node.data.entries.length !== node.data.length;
 		let hoisted_count = 0;
+		/** Keyed async values need a name so the registry sidecar can capture their target. @param {GraphNode} node */
+		const is_keyed = (node) => node.kind === 'Async' && node.data.key !== undefined;
 		for (const node of order) {
-			if (node.uses > 1 || node.opaque || node.kind === 'NullObject' || is_sparse(node)) {
+			if (node.uses > 1 || node.opaque || node.kind === 'NullObject' || is_sparse(node) || is_keyed(node)) {
 				node.hoisted = true;
 				hoisted_count++;
 			}
@@ -1139,6 +1201,12 @@ class Session {
 		}
 
 		const root = expression(value);
+		for (const node of order) {
+			if (!is_keyed(node)) continue;
+			// Register `[target, control]` so settlements from any session can address it by key.
+			const control = node.data.captured ? `,s.p[${node.data.pending}]` : '';
+			sidecars.push(`(s.k||(s.k={__proto__:null}))[${stringify_string(node.data.key)}]=[${node.name}${control}]`);
+		}
 		if (persistent) {
 			for (const node of order) {
 				if (!node.opaque) continue;
@@ -1252,13 +1320,13 @@ class Session {
 	}
 
 	/**
-	 * Emits source that removes this session from the retained table.
+	 * Emits source that removes a session from the retained table.
 	 *
+	 * @param {string} id
 	 * @returns {string}
 	 */
-	#cleanup_source() {
-		const id = stringify_string(this.#id);
-		return `delete n[${id}]`;
+	#cleanup_source(id) {
+		return `delete n[${stringify_string(id)}]`;
 	}
 
 	/**
@@ -1269,7 +1337,23 @@ class Session {
 	 * @returns {string}
 	 */
 	#emit_batch(batch, block = true) {
-		const prefix = block ? `;${this.#scope}[${stringify_string(this.#id)}].b((s,n)=>{` : '';
+		// Detached blocks attach to the saved head's session directly rather than through its
+		// dispatcher (which the saved head may not have defined). The first block takes the
+		// session over: only the keyed registry survives, since the saved head's positional
+		// state was allocated by a different serialization and is never addressed again.
+		const scope = this.#scope;
+		const id = stringify_string(this.#id);
+		let prefix = '';
+		if (block && this.#detached) {
+			prefix = `;(()=>{let n=${scope},s=n?.[${id}];`;
+			if (!this.#detached_started) {
+				this.#set_private('detached_started', true);
+				prefix += `if(!s)throw new Error(${stringify_string(`devalue: missing session ${this.#id}`)});s.a=[];s.s=[];s.c=[];s.p=[];`;
+			}
+		} else if (block) {
+			prefix = `;${scope}[${id}].b((s,n)=>{`;
+		}
+		const suffix = !block ? '' : this.#detached ? '})()' : '})';
 		const marker = this.#begin_transaction();
 		const operations = [];
 		/** @type {Set<GraphNode>} */
@@ -1282,9 +1366,15 @@ class Session {
 			references.add(node);
 			const target_token = this.#placeholder();
 			const control_token = node.data.captured ? this.#placeholder() : undefined;
+			// Keyed values settle through the registry so a detached tail can address a value
+			// constructed by a different (saved) head. The guard makes a missing key explicit.
+			const entry = node.data.key === undefined ? undefined : `s.k[${stringify_string(node.data.key)}]`;
+			const guard = entry
+				? `if(!s.k?.[${stringify_string(node.data.key)}])throw new Error(${stringify_string(`devalue: missing asynchronous value ${node.data.key}`)});`
+				: '';
 			const reference = {
-				target: target_token,
-				control: control_token
+				target: entry ? `${entry}[0]` : target_token,
+				control: entry ? `${entry}[1]` : control_token
 			};
 			let value_source;
 			/** @type {{ name: string, write: string, folded: string, tokens: Map<string, any> } | undefined} */
@@ -1326,6 +1416,7 @@ class Session {
 				else if (event.type === 'complete') operation = source.descriptor.complete(reference, value_source);
 				else operation = source.descriptor.error(reference, value_source);
 				if (typeof operation !== 'string') throw new TypeError('Invalid async descriptor operation');
+				operation = guard + operation;
 				const tokens = operation_tokens(node, target_token, control_token);
 				if (anchor) {
 					if (count_occurrences(operation, value_source) === 1) {
@@ -1347,14 +1438,17 @@ class Session {
 						? source.descriptor.error(reference, generic_error)
 						: source.descriptor.reject(reference, generic_error);
 					if (typeof fallback !== 'string') throw new TypeError('Invalid async descriptor operation');
-					operations.push({ source: fallback, tokens: operation_tokens(node, target_token, control_token) });
+					operations.push({ source: guard + fallback, tokens: operation_tokens(node, target_token, control_token) });
 					this.#set(event, 'type', source.type === 'sequence' ? 'error' : 'reject');
 				} else {
 					throw error;
 				}
 			}
-			if (event.type !== 'next' && node.data.captured && !source.descriptor.manages_pending) {
+			if (event.type !== 'next' && node.data.captured && !source.descriptor.manages_pending && !this.#detached_tail) {
 				operations.push({ source: `delete s.p[${node.data.pending}]`, tokens: new Map() });
+			}
+			if (event.type !== 'next' && entry) {
+				operations.push({ source: `delete ${entry}`, tokens: new Map() });
 			}
 			if (event.type !== 'next') {
 				this.#set_private('active', this.#active - 1);
@@ -1363,7 +1457,7 @@ class Session {
 		}
 		const rendered = this.#render_operations(operations, references);
 		if (block && this.#active === 0 && this.#batch.length === 0) {
-			rendered.push(this.#cleanup_source());
+			rendered.push(this.#cleanup_source(this.#id));
 		}
 		let body = rendered.join(';');
 		if (block) {
@@ -1373,7 +1467,7 @@ class Session {
 			const resolved = this.#resolve_runtime_declarations(body);
 			body = resolved.defs.length ? `${resolved.defs.join(';')};${resolved.source}` : resolved.source;
 		}
-		const result = prefix + body + (block ? '})' : rendered.length ? ';' : '');
+		const result = prefix + body + (block ? suffix : rendered.length ? ';' : '');
 		this.#commit_transaction(marker);
 		return result;
 		} catch (error) {

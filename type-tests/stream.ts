@@ -16,6 +16,7 @@ const reference: ClientReference = { target: 'remote', control: 'controller' };
 
 const value: AsyncValueDescriptor<number> = {
 	type: 'async-value',
+	id: 'typed-value',
 	source: promise,
 	construct: () => 'new Remote()',
 	resolve: ({ target }: ClientReference, source) => `${target}.resolve(${source})`,
@@ -32,7 +33,7 @@ const iterable: AsyncSequenceDescriptor<number, string> = {
 };
 
 const replacer: UnevalStreamReplacer = () => value;
-const options: UnevalStreamOptions = { id: 'typed' };
+const options: UnevalStreamOptions = { id: 'typed', detached: true };
 const result: UnevalStreamResult = await unevalStream(iterable, replacer, options);
 const { head, tail, id }: { head: string; tail: UnevalStreamTail; id: string } = result;
 await tail.return();
