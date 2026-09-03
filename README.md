@@ -283,10 +283,7 @@ const template = `
 
 ```html
 <script>
-	var preloaded = {
-		userinput:
-			"\\u003C\\u002Fscript\\u003E\\u003Cscript src='https:\\u002F\\u002Fevil.com\\u002Fmwahaha.js'\\u003E"
-	};
+	var preloaded = { userinput: "\u003C/script>\u003Cscript src='https://evil.com/mwahaha.js'>" };
 </script>
 ```
 
